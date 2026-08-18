@@ -139,6 +139,77 @@ async function fetchRotowireLineups() {
   return result;
 }
 
+// ─── Roster lookup (resolve player IDs for Rotowire-projected names) ──────────
+
+/** MLB Stats API team IDs by standard abbreviation. */
+const TEAM_ID = {
+  ARI: 109, ATL: 144, BAL: 110, BOS: 111, CHC: 112, CWS: 145,
+  CIN: 113, CLE: 114, COL: 115, DET: 116, HOU: 117, KC:  118,
+  LAA: 108, LAD: 119, MIA: 146, MIL: 158, MIN: 142, NYM: 121,
+  NYY: 147, OAK: 133, PHI: 143, PIT: 134, SD:  135, SF:  137,
+  SEA: 136, STL: 138, TB:  139, TEX: 140, TOR: 141, WSH: 120,
+};
+
+/** Normalize a player name for matching: strip accents, lowercase, collapse spaces. */
+function normName(name) {
+  return String(name || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .trim();
+}
+
+// Daily cache: { date, ids: Map('TEAM|normname' → playerId) }
+let rosterIdCache = { date: null, ids: null };
+
+/** Build (and cache per date) a team-roster name→id map for the given teams. */
+async function buildRosterIdMap(teams, date) {
+  if (rosterIdCache.date === date && rosterIdCache.ids) return rosterIdCache.ids;
+
+  const ids = new Map();
+  await Promise.allSettled(
+    teams.filter(t => TEAM_ID[t]).map(async (t) => {
+      try {
+        const { data } = await axios.get(`${MLB_API}/teams/${TEAM_ID[t]}/roster`, {
+          timeout: 20_000,
+          headers: { 'User-Agent': 'mlb-lineup-server/1.0' },
+        });
+        for (const r of (data.roster || [])) {
+          if (r.person?.id) ids.set(`${t}|${normName(r.person?.fullName)}`, r.person.id);
+        }
+      } catch (err) {
+        console.error(`[scraper] roster fetch failed for ${t}: ${err.message}`);
+      }
+    })
+  );
+
+  rosterIdCache = { date, ids };
+  console.log(`[scraper] roster id map: ${ids.size} players across ${teams.length} teams`);
+  return ids;
+}
+
+/**
+ * Look up a player id by team + name. Falls back to a global unique-name match
+ * across all fetched rosters; returns null when ambiguous or unknown so the
+ * app-side exact/suffix resolver can handle it safely.
+ */
+function lookupPlayerId(ids, team, name) {
+  const direct = ids.get(`${team}|${normName(name)}`);
+  if (direct) return direct;
+
+  let match = null;
+  let count = 0;
+  for (const [key, id] of ids) {
+    if (key.endsWith(`|${normName(name)}`)) {
+      match = id;
+      count += 1;
+      if (count > 1) return null;   // ambiguous — bail
+    }
+  }
+  return count === 1 ? match : null;
+}
+
 // ─── Main export ──────────────────────────────────────────────────────────────
 
 /**
@@ -154,6 +225,18 @@ async function scrapeAndSave(date) {
     fetchMLBSchedule(date),
     fetchRotowireLineups(),
   ]);
+
+  // Collect the teams playing today, then resolve Rotowire names → MLB player IDs
+  const teamsPlaying = new Set();
+  for (const dateEntry of (schedData.dates || [])) {
+    for (const g of dateEntry.games) {
+      const a = g.teams?.away?.team?.abbreviation;
+      const h = g.teams?.home?.team?.abbreviation;
+      if (a) teamsPlaying.add(a);
+      if (h) teamsPlaying.add(h);
+    }
+  }
+  const rosterIds = await buildRosterIdMap([...teamsPlaying], date);
 
   /** @type {Array} */
   const games    = [];
@@ -193,7 +276,7 @@ async function scrapeAndSave(date) {
             updated_at: now,
           }))
         : (rotowire[awayTeam] || []).map(p => ({
-            player_id:  null,
+            player_id:  lookupPlayerId(rosterIds, awayTeam, p.name),
             name:       p.name,
             position:   p.position,
             source:     'rotowire_projected',
@@ -212,7 +295,7 @@ async function scrapeAndSave(date) {
             updated_at: now,
           }))
         : (rotowire[homeTeam] || []).map(p => ({
-            player_id:  null,
+            player_id:  lookupPlayerId(rosterIds, homeTeam, p.name),
             name:       p.name,
             position:   p.position,
             source:     'rotowire_projected',

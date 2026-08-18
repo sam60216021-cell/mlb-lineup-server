@@ -22,6 +22,7 @@
  */
 
 const express  = require('express');
+const axios    = require('axios');
 const cron     = require('node-cron');
 const winston  = require('winston');
 const fs       = require('fs');
@@ -62,6 +63,11 @@ const logger = winston.createLogger({
 const PORT     = parseInt(process.env.PORT || '3001', 10);
 const DATA_DIR = path.join(__dirname, 'data', 'lineups');
 
+// The Odds API (pitcher strikeout props). Set ODDS_API_KEY in the environment.
+const ODDS_API_KEY = process.env.ODDS_API_KEY || '';
+const ODDS_BASE    = 'https://api.the-odds-api.com/v4';
+const BOOKMAKERS   = 'fanduel,draftkings,fanatics,prizepicks';
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Today's date in Eastern time (YYYY-MM-DD). */
@@ -69,16 +75,41 @@ function todayET() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 }
 
-/** Load today's lineup JSON from disk. Returns null if the file doesn't exist. */
-function loadToday() {
-  const filePath = path.join(DATA_DIR, `${todayET()}.json`);
+/** Validate a ?date= query param (YYYY-MM-DD). Returns null when invalid. */
+function validDateParam(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null;
+}
+
+/** Load the lineup JSON for an arbitrary date. Returns null if the file doesn't exist. */
+function loadDate(date) {
+  const filePath = path.join(DATA_DIR, `${date}.json`);
   if (!fs.existsSync(filePath)) return null;
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
   } catch (err) {
-    logger.error(`Failed to parse lineup file: ${err.message}`);
+    logger.error(`Failed to parse lineup file ${date}: ${err.message}`);
     return null;
   }
+}
+
+/** Load today's lineup JSON from disk. Returns null if the file doesn't exist. */
+function loadToday() {
+  return loadDate(todayET());
+}
+
+/**
+ * Resolve the data for a request: `?date=` if provided (files are scraped on a
+ * daily cadence, so historical/future dates serve whatever is on disk), else
+ * today. If today has no data yet, an on-demand scrape is attempted.
+ */
+async function resolveRequestData(req) {
+  const date = validDateParam(req.query.date) || todayET();
+  let raw = loadDate(date);
+  if (!raw && date === todayET()) {
+    logger.info(`[api] No data for today — on-demand scrape`);
+    raw = await runScrape('on-demand');
+  }
+  return { date, raw };
 }
 
 // ─── Scrape runner ────────────────────────────────────────────────────────────
@@ -131,19 +162,21 @@ app.get('/', (_req, res) => {
       lineups:  'GET /mlb/lineups',
       schedule: 'GET /mlb/schedule',
       roster:   'GET /mlb/roster',
+      odds:     'GET /mlb/odds/strikeouts',
     },
+    odds_configured: Boolean(ODDS_API_KEY),
     cron: ['9:00 AM ET', '1:00 PM ET', '5:00 PM ET'],
   });
 });
 
-// GET /mlb/lineups
+// GET /mlb/lineups (?date=YYYY-MM-DD optional)
 // Shape expected by LocalDataService.swift:
 //   { date, games: [{ game_id, away, home, start_time, away_batting_order, home_batting_order, ... }] }
-app.get('/mlb/lineups', (req, res) => {
-  const raw = loadToday();
+app.get('/mlb/lineups', async (req, res) => {
+  const { date, raw } = await resolveRequestData(req);
   if (!raw) {
     return res.status(404).json({
-      error: 'Lineups not yet available for today. The server scrapes at 9 AM, 1 PM, and 5 PM ET.',
+      error: `Lineups not yet available for ${date}. The server scrapes at 9 AM, 1 PM, and 5 PM ET.`,
     });
   }
 
@@ -170,13 +203,13 @@ app.get('/mlb/lineups', (req, res) => {
   });
 });
 
-// GET /mlb/schedule
+// GET /mlb/schedule (?date=YYYY-MM-DD optional)
 // Alias — same data in a schedule-centric shape.
-app.get('/mlb/schedule', (req, res) => {
-  const raw = loadToday();
+app.get('/mlb/schedule', async (req, res) => {
+  const { date, raw } = await resolveRequestData(req);
   if (!raw) {
     return res.status(404).json({
-      error: 'Schedule not yet available for today.',
+      error: `Schedule not yet available for ${date}.`,
     });
   }
 
@@ -199,13 +232,13 @@ app.get('/mlb/schedule', (req, res) => {
   });
 });
 
-// GET /mlb/roster
+// GET /mlb/roster (?date=YYYY-MM-DD optional)
 // Flat player list expected by LocalDataService.swift:
 //   { players: [{ player_id, name, team, pos }] }
-app.get('/mlb/roster', (req, res) => {
-  const raw = loadToday();
+app.get('/mlb/roster', async (req, res) => {
+  const { date, raw } = await resolveRequestData(req);
   if (!raw) {
-    return res.status(404).json({ error: 'Roster not yet available for today.' });
+    return res.status(404).json({ error: `Roster not yet available for ${date}.` });
   }
 
   const seen    = new Set();
@@ -237,6 +270,129 @@ app.get('/mlb/roster', (req, res) => {
   }
 
   res.json({ players });
+});
+
+// ─── /mlb/odds/strikeouts ─────────────────────────────────────────────────────
+// Pitcher strikeout props from The Odds API for every MLB game today.
+// Cached in memory for 10 minutes so the iOS app gets fast responses without
+// burning extra API credits. Requires ODDS_API_KEY in the environment.
+//
+// Response shape:
+//   {
+//     "cached_at": "2026-08-18T00:00:00.000Z",
+//     "props": [
+//       { "player_name": "Gerrit Cole", "market": "pitcher_strikeouts",
+//         "bookmakers": [ { "key": "fanduel", "title": "FanDuel",
+//                           "line": 6.5, "over_odds": -115, "under_odds": -110 } ] }
+//     ]
+//   }
+const STRIKEOUTS_TTL = 10 * 60 * 1000;   // 10 minutes
+let strikeoutsCache = null;              // { data, ts }
+
+function isFresh(entry, ttl) {
+  return entry !== null && (Date.now() - entry.ts) < ttl;
+}
+
+app.get('/mlb/odds/strikeouts', async (_req, res) => {
+  if (isFresh(strikeoutsCache, STRIKEOUTS_TTL)) {
+    return res.json(strikeoutsCache.data);
+  }
+
+  if (!ODDS_API_KEY) {
+    return res.status(503).json({ error: 'ODDS_API_KEY not configured on server' });
+  }
+
+  try {
+    // 1. Fetch all MLB events for today
+    const eventsResp = await axios.get(`${ODDS_BASE}/sports/baseball_mlb/events`, {
+      params: { apiKey: ODDS_API_KEY },
+      timeout: 15000,
+    });
+    const events = eventsResp.data || [];
+    logger.info(`[strikeouts] fetching odds for ${events.length} events`);
+
+    // 2. Fetch pitcher_strikeouts odds for every event in parallel.
+    //    propMap: playerName → { player_name, market, bookmakers[] }
+    const propMap = new Map();
+
+    await Promise.allSettled(
+      events.map(async (event) => {
+        try {
+          const oddsResp = await axios.get(
+            `${ODDS_BASE}/sports/baseball_mlb/events/${event.id}/odds`,
+            {
+              params: {
+                apiKey:     ODDS_API_KEY,
+                regions:    'us',
+                markets:    'pitcher_strikeouts',
+                bookmakers: BOOKMAKERS,
+                oddsFormat: 'american',
+              },
+              timeout: 15000,
+            }
+          );
+
+          for (const bookmaker of oddsResp.data.bookmakers || []) {
+            for (const market of bookmaker.markets || []) {
+              if (market.key !== 'pitcher_strikeouts') continue;
+
+              // Group Over + Under outcomes by player name
+              const byPlayer = new Map();
+              for (const outcome of market.outcomes || []) {
+                const playerName = outcome.description;
+                if (!playerName) continue;
+                if (!byPlayer.has(playerName)) {
+                  byPlayer.set(playerName, { over: null, under: null });
+                }
+                const sides = byPlayer.get(playerName);
+                if (outcome.name === 'Over') {
+                  sides.over = { price: outcome.price, point: outcome.point };
+                } else if (outcome.name === 'Under') {
+                  sides.under = { price: outcome.price, point: outcome.point };
+                }
+              }
+
+              for (const [playerName, sides] of byPlayer) {
+                if (!propMap.has(playerName)) {
+                  propMap.set(playerName, {
+                    player_name: playerName,
+                    market:      'pitcher_strikeouts',
+                    bookmakers:  [],
+                  });
+                }
+                const entry = propMap.get(playerName);
+                const line  = sides.over?.point ?? sides.under?.point ?? 0;
+                entry.bookmakers.push({
+                  key:        bookmaker.key,
+                  title:      bookmaker.title,
+                  line,
+                  over_odds:  sides.over  ? sides.over.price  : null,
+                  under_odds: sides.under ? sides.under.price : null,
+                });
+              }
+            }
+          }
+        } catch (e) {
+          // A single-event failure is non-fatal — skip and continue
+          logger.warn(`[strikeouts] event ${event.id} odds failed: ${e.message}`);
+        }
+      })
+    );
+
+    const props   = Array.from(propMap.values());
+    const payload = { cached_at: new Date().toISOString(), props };
+
+    strikeoutsCache = { data: payload, ts: Date.now() };
+    logger.info(`[strikeouts] cached ${props.length} pitcher props`);
+    res.json(payload);
+  } catch (err) {
+    logger.error(`[strikeouts] error: ${err.message}`);
+    // Serve stale cache on network failure
+    if (strikeoutsCache) {
+      return res.json(strikeoutsCache.data);
+    }
+    res.status(502).json({ error: 'Failed to fetch strikeout odds', detail: err.message });
+  }
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
